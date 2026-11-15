@@ -36,10 +36,27 @@ export const registerService = async (
   }
 };
 
-export const markEmailAsVerified = async(id: string) => {
+export const markEmailAsVerified = async (id: string) => {
   const query = `UPDATE user SET is_email_verified=TRUE WHERE id=$1`
   const values = [id]
 
   const result = await getPool().query(query, values);
   return result.rows[0];
+};
+
+interface User extends RegisteredUser {
+  password: string,
+  two_factor_enabled: string,
+  token_version: string
+}
+
+export const findUserByEmail = async (email: string): Promise<User | null> => {
+  const query = `SELECT * FROM users WHERE email=$1`;
+  const value = [email];
+  const result = await getPool().query(query, value);
+  if (result.rows[0] !== null) {
+    return result.rows[0];
+  }
+
+  return null;
 }

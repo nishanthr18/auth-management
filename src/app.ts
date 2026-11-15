@@ -1,6 +1,7 @@
 import express from "express";
 import cookieParser from "cookie-parser";
 import type { Request, Response } from 'express';
+import { authRoute } from "./routes/routes";
 
 const app = express();
 
@@ -10,5 +11,7 @@ app.use(cookieParser());
 app.use('/health', (_req: Request, res: Response) => {
     res.status(200).json({ health: 'OK' })
 });
+
+app.use('/auth', authRoute);
 
 export default app;

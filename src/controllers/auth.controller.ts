@@ -1,24 +1,28 @@
 import bcrypt from 'bcryptjs';
 import type { Request, Response, NextFunction } from 'express';
-import { markEmailAsVerified, registerService } from '../repositories/auth.repository';
+import {
+  findUserByEmail,
+  markEmailAsVerified,
+  registerService,
+} from '../repositories/auth.repository';
 import jwt, { type JwtPayload } from 'jsonwebtoken';
 import { sendVerificationMail } from '../lib/mail';
 
 interface EmailVerificationPayload extends JwtPayload {
-    sub: string;
-    purpose: 'email_verification';
+  sub: string;
+  purpose: 'email_verification';
 }
 
 const hashPassword = async (password: string): Promise<string> => {
-    const salt = await bcrypt.genSalt(12);
-    return bcrypt.hash(password, salt);
+  const salt = await bcrypt.genSalt(12);
+  return bcrypt.hash(password, salt);
 };
 
 const getVerificationEmailTemplate = (
-    name: string,
-    verifyUrl: string
+  name: string,
+  verifyUrl: string
 ): string => {
-    return `
+  return `
     <!DOCTYPE html>
     <html>
       <head>
@@ -183,127 +187,200 @@ const getVerificationEmailTemplate = (
 };
 
 const escapeHtml = (value: string): string => {
-    return value.replace(/[&<>"']/g, (char) => {
-        const entities: Record<string, string> = {
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;',
-            "'": '&#39;',
-        };
+  return value.replace(/[&<>"']/g, (char) => {
+    const entities: Record<string, string> = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    };
 
-        return entities[char];
-    });
+    return entities[char];
+  });
 };
 
 const getAppUrl = (): string => {
-    const url = process.env.APP_URL || `http://localhost:${process.env.PORT || 6000}`;
-
-    return url.replace(/\/+$/, '');
+  const url = process.env.APP_URL || `http://localhost:${process.env.PORT || 6000}`;
+  return url.replace(/\/+$/, '');
 };
 
 export const registerController = async (
-    req: Request,
-    res: Response,
+  req: Request,
+  res: Response,
+  next: NextFunction
 ) => {
-    try {
-        const { name, email, password } = req.body;
+  try {
+    const { name, email, password } = req.body;
 
-        // Hash password
-        const passwordHash = await hashPassword(password);
-
-        // Create user
-        const data = await registerService(
-            name,
-            email,
-            passwordHash,
-            'USER',
-            false,
-            false
-        );
-
-        // Generate email verification token
-        const verificationSecret = process.env.EMAIL_VERIFICATION_SECRET;
-
-        if (!verificationSecret) {
-            throw new Error('EMAIL_VERIFICATION_SECRET is missing');
-        }
-
-        const verifyToken = jwt.sign(
-            {
-                sub: String(data.id),
-                purpose: 'email_verification',
-            },
-            verificationSecret,
-            {
-                expiresIn: '1d',
-            }
-        );
-
-        // Generate verification URL
-        const verifyUrl =
-            `${getAppUrl()}/auth/verify-email?token=${encodeURIComponent(verifyToken)}`;
-
-        // Generate email HTML
-        const html = getVerificationEmailTemplate(name, verifyUrl);
-
-        // Send email
-        await sendVerificationMail(
-            data.email,
-            'Verify your email address',
-            html
-        );
-
-        // Return safe user data
-        res.status(201).json({
-            message: 'Registration successful. Please verify your email.',
-            data: {
-                id: data.id,
-                name: data.name,
-                email: data.email,
-            },
-        });
-
-    } catch (error) {
-        return res.status(500).json({ error });
+    if (!name || !email || !password) {
+      return res.status(400).json({ message: 'Name, email, and password are required' });
     }
+
+    const normalizedName = String(name).trim();
+    const normalizedEmail = String(email).toLowerCase().trim();
+
+    const passwordHash = await hashPassword(String(password));
+
+    const data = await registerService(
+      normalizedName,
+      normalizedEmail,
+      passwordHash,
+      'USER',
+      false,
+      false
+    );
+
+    const verificationSecret = process.env.EMAIL_VERIFICATION_SECRET;
+    if (!verificationSecret) {
+      throw new Error('EMAIL_VERIFICATION_SECRET is missing');
+    }
+
+    const verifyToken = jwt.sign(
+      {
+        sub: String(data.id),
+        purpose: 'email_verification',
+      },
+      verificationSecret,
+      { expiresIn: '1d' }
+    );
+
+    const verifyUrl =
+      `${getAppUrl()}/auth/verify-email?token=${encodeURIComponent(verifyToken)}`;
+
+    const html = getVerificationEmailTemplate(normalizedName, verifyUrl);
+
+    await sendVerificationMail(
+      data.email,
+      'Verify your email address',
+      html
+    );
+
+    return res.status(201).json({
+      message: 'Registration successful. Please verify your email.',
+      data: {
+        id: data.id,
+        name: data.name,
+        email: data.email,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
 };
 
-export const verifyEmail = async (req: Request, res: Response) => {
-    const { token } = req.query;
-    const verificationSecret = process.env.EMAIL_VERIFICATION_SECRET;
+export const verifyEmail = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  const { token } = req.query;
+  const verificationSecret = process.env.EMAIL_VERIFICATION_SECRET;
 
-    if (!token || typeof token !== 'string') {
-        return res.status(400).json({ message: 'Verification token is required' });
+  if (!token || typeof token !== 'string') {
+    return res.status(400).json({ message: 'Verification token is required' });
+  }
+
+  if (!verificationSecret) {
+    return res.status(500).json({ message: 'Server configuration error' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, verificationSecret) as EmailVerificationPayload;
+
+    if (decoded.purpose !== 'email_verification' || !decoded.sub) {
+      return res.status(400).json({ message: 'Invalid verification token' });
     }
 
-    if (!verificationSecret) {
-        return res.status(500).json({ message: 'Server configuration error' });
+    await markEmailAsVerified(decoded.sub);
+
+    return res.status(200).json({ message: 'Email verified successfully' });
+  } catch (error) {
+    if (error instanceof jwt.TokenExpiredError) {
+      return res.status(401).json({
+        message: 'Verification link has expired. Please request a new one.',
+      });
     }
 
-    try {
-        const decoded = jwt.verify(token, verificationSecret) as EmailVerificationPayload;
-
-        if (decoded.purpose !== 'email_verification' || !decoded.sub) {
-            return res.status(400).json({ message: 'Invalid verification token' });
-        }
-
-        await markEmailAsVerified(decoded.sub);
-
-        return res.status(200).json({ message: 'Email verified successfully' });
-    } catch (error) {
-        if (error instanceof jwt.TokenExpiredError) {
-            return res.status(401).json({
-                message: 'Verification link has expired. Please request a new one.',
-            });
-        }
-
-        if (error instanceof jwt.JsonWebTokenError) {
-            return res.status(400).json({
-                message: 'Invalid verification link.',
-            });
-        }
-
-        return res.status(500).json({ message: 'Internal server error' });
+    if (error instanceof jwt.JsonWebTokenError) {
+      return res.status(400).json({
+        message: 'Invalid verification link.',
+      });
     }
+
+    next(error);
+  }
+};
+
+export const loginHandler = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password || typeof email !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({ message: 'Email and password are required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await findUserByEmail(normalizedEmail);
+
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    if (!user.is_email_verified) {
+      return res.status(403).json({
+        message: 'Please verify your email address before logging in',
+      });
+    }
+
+    if (user.two_factor_enabled) {
+      return res.status(200).json({
+        requiresTwoFactor: true,
+        message: 'Two-factor authentication code required',
+      });
+    }
+
+    const jwtSecret = process.env.JWT_SECRET;
+    if (!jwtSecret) {
+      throw new Error('JWT_SECRET is missing');
+    }
+
+    const token = jwt.sign(
+      {
+        sub: String(user.id),
+        role: user.role,
+        tokenVersion: user.token_version,
+      },
+      jwtSecret,
+      { expiresIn: '1d' }
+    );
+
+    res.cookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+
+    return res.status(200).json({
+      message: 'Login successful',
+      data: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
 };
