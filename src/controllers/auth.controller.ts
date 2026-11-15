@@ -1,0 +1,309 @@
+import bcrypt from 'bcryptjs';
+import type { Request, Response, NextFunction } from 'express';
+import { markEmailAsVerified, registerService } from '../repositories/auth.repository';
+import jwt, { type JwtPayload } from 'jsonwebtoken';
+import { sendVerificationMail } from '../lib/mail';
+
+interface EmailVerificationPayload extends JwtPayload {
+    sub: string;
+    purpose: 'email_verification';
+}
+
+const hashPassword = async (password: string): Promise<string> => {
+    const salt = await bcrypt.genSalt(12);
+    return bcrypt.hash(password, salt);
+};
+
+const getVerificationEmailTemplate = (
+    name: string,
+    verifyUrl: string
+): string => {
+    return `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Verify Your Email</title>
+      </head>
+
+      <body style="
+        margin: 0;
+        padding: 0;
+        background-color: #f4f6f8;
+        font-family: Arial, Helvetica, sans-serif;
+        color: #333333;
+      ">
+
+        <table width="100%" cellpadding="0" cellspacing="0"
+          style="padding: 40px 15px;">
+          <tr>
+            <td align="center">
+
+              <table width="100%" cellpadding="0" cellspacing="0"
+                style="
+                  max-width: 560px;
+                  background-color: #ffffff;
+                  border-radius: 10px;
+                  overflow: hidden;
+                ">
+
+                <!-- Header -->
+                <tr>
+                  <td style="
+                    background-color: #2563eb;
+                    padding: 30px;
+                    text-align: center;
+                  ">
+                    <h1 style="
+                      margin: 0;
+                      color: #ffffff;
+                      font-size: 24px;
+                    ">
+                      Welcome Aboard!
+                    </h1>
+                  </td>
+                </tr>
+
+                <!-- Content -->
+                <tr>
+                  <td style="padding: 35px 30px;">
+
+                    <h2 style="
+                      margin-top: 0;
+                      font-size: 21px;
+                      color: #111827;
+                    ">
+                      Hello ${escapeHtml(name)},
+                    </h2>
+
+                    <p style="
+                      font-size: 15px;
+                      line-height: 1.7;
+                      color: #4b5563;
+                    ">
+                      Thank you for creating an account with us.
+                      We're excited to have you on board!
+                    </p>
+
+                    <p style="
+                      font-size: 15px;
+                      line-height: 1.7;
+                      color: #4b5563;
+                    ">
+                      To complete your registration and secure your
+                      account, please verify your email address by
+                      clicking the button below.
+                    </p>
+
+                    <!-- Verification Button -->
+                    <table cellpadding="0" cellspacing="0"
+                      style="margin: 30px auto;">
+                      <tr>
+                        <td align="center"
+                          style="
+                            background-color: #2563eb;
+                            border-radius: 6px;
+                          ">
+                          <a href="${verifyUrl}"
+                            style="
+                              display: inline-block;
+                              padding: 14px 30px;
+                              color: #ffffff;
+                              text-decoration: none;
+                              font-size: 15px;
+                              font-weight: bold;
+                            ">
+                            Verify Email Address
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+
+                    <p style="
+                      font-size: 14px;
+                      line-height: 1.6;
+                      color: #6b7280;
+                    ">
+                      This verification link will expire in 24 hours.
+                      If you didn't create an account, you can safely
+                      ignore this email.
+                    </p>
+
+                    <p style="
+                      font-size: 13px;
+                      line-height: 1.6;
+                      color: #9ca3af;
+                      margin-top: 30px;
+                    ">
+                      If the button doesn't work, copy and paste
+                      the following link into your browser:
+                    </p>
+
+                    <p style="
+                      font-size: 12px;
+                      word-break: break-all;
+                      color: #2563eb;
+                    ">
+                      <a href="${verifyUrl}" style="color: #2563eb;">
+                        ${verifyUrl}
+                      </a>
+                    </p>
+
+                  </td>
+                </tr>
+
+                <!-- Footer -->
+                <tr>
+                  <td style="
+                    background-color: #f9fafb;
+                    padding: 20px;
+                    text-align: center;
+                  ">
+                    <p style="
+                      margin: 0;
+                      font-size: 12px;
+                      color: #9ca3af;
+                    ">
+                      © ${new Date().getFullYear()} Your Application.
+                      All rights reserved.
+                    </p>
+                  </td>
+                </tr>
+
+              </table>
+
+            </td>
+          </tr>
+        </table>
+
+      </body>
+    </html>
+  `;
+};
+
+const escapeHtml = (value: string): string => {
+    return value.replace(/[&<>"']/g, (char) => {
+        const entities: Record<string, string> = {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;',
+        };
+
+        return entities[char];
+    });
+};
+
+const getAppUrl = (): string => {
+    const url = process.env.APP_URL || `http://localhost:${process.env.PORT || 6000}`;
+
+    return url.replace(/\/+$/, '');
+};
+
+export const registerController = async (
+    req: Request,
+    res: Response,
+) => {
+    try {
+        const { name, email, password } = req.body;
+
+        // Hash password
+        const passwordHash = await hashPassword(password);
+
+        // Create user
+        const data = await registerService(
+            name,
+            email,
+            passwordHash,
+            'USER',
+            false,
+            false
+        );
+
+        // Generate email verification token
+        const verificationSecret = process.env.EMAIL_VERIFICATION_SECRET;
+
+        if (!verificationSecret) {
+            throw new Error('EMAIL_VERIFICATION_SECRET is missing');
+        }
+
+        const verifyToken = jwt.sign(
+            {
+                sub: String(data.id),
+                purpose: 'email_verification',
+            },
+            verificationSecret,
+            {
+                expiresIn: '1d',
+            }
+        );
+
+        // Generate verification URL
+        const verifyUrl =
+            `${getAppUrl()}/auth/verify-email?token=${encodeURIComponent(verifyToken)}`;
+
+        // Generate email HTML
+        const html = getVerificationEmailTemplate(name, verifyUrl);
+
+        // Send email
+        await sendVerificationMail(
+            data.email,
+            'Verify your email address',
+            html
+        );
+
+        // Return safe user data
+        res.status(201).json({
+            message: 'Registration successful. Please verify your email.',
+            data: {
+                id: data.id,
+                name: data.name,
+                email: data.email,
+            },
+        });
+
+    } catch (error) {
+        return res.status(500).json({ error });
+    }
+};
+
+export const verifyEmail = async (req: Request, res: Response) => {
+    const { token } = req.query;
+    const verificationSecret = process.env.EMAIL_VERIFICATION_SECRET;
+
+    if (!token || typeof token !== 'string') {
+        return res.status(400).json({ message: 'Verification token is required' });
+    }
+
+    if (!verificationSecret) {
+        return res.status(500).json({ message: 'Server configuration error' });
+    }
+
+    try {
+        const decoded = jwt.verify(token, verificationSecret) as EmailVerificationPayload;
+
+        if (decoded.purpose !== 'email_verification' || !decoded.sub) {
+            return res.status(400).json({ message: 'Invalid verification token' });
+        }
+
+        await markEmailAsVerified(decoded.sub);
+
+        return res.status(200).json({ message: 'Email verified successfully' });
+    } catch (error) {
+        if (error instanceof jwt.TokenExpiredError) {
+            return res.status(401).json({
+                message: 'Verification link has expired. Please request a new one.',
+            });
+        }
+
+        if (error instanceof jwt.JsonWebTokenError) {
+            return res.status(400).json({
+                message: 'Invalid verification link.',
+            });
+        }
+
+        return res.status(500).json({ message: 'Internal server error' });
+    }
+};
