@@ -59,4 +59,11 @@ export const findUserByEmail = async (email: string): Promise<User | null> => {
   }
 
   return null;
-}
+};
+
+export const findUserById = async (id: string) => {
+  const query = `SELECT * FROM users WHERE id=$1`;
+  const value = [id];
+  const result = await getPool().query(query, value);
+  return result.rows[0]
+};

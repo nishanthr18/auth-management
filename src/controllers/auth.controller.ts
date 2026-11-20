@@ -2,6 +2,7 @@ import bcrypt from 'bcryptjs';
 import type { Request, Response, NextFunction } from 'express';
 import {
   findUserByEmail,
+  findUserById,
   markEmailAsVerified,
   registerService,
 } from '../repositories/auth.repository';
@@ -312,6 +313,39 @@ export const verifyEmail = async (
   }
 };
 
+const createToken = (
+  id: string,
+  role: string,
+  tokenVersion: number,
+  jwtSecret: string,
+  type: string = "AUTH_TOKEN",
+) => {
+  if (type === 'AUTH_TOKEN') {
+    const token = jwt.sign(
+      {
+        sub: id,
+        role,
+        tokenVersion,
+      },
+      jwtSecret,
+      { expiresIn: '1d' }
+    );
+    return token;
+  }
+
+  if (type === "REFRESH_TOKEN") {
+    const token = jwt.sign(
+      {
+        sub: id,
+        tokenVersion,
+      },
+      jwtSecret,
+      { expiresIn: '7d' }
+    );
+    return token;
+  }
+};
+
 export const loginHandler = async (
   req: Request,
   res: Response,
@@ -342,33 +376,26 @@ export const loginHandler = async (
       });
     }
 
-    if (user.two_factor_enabled) {
-      return res.status(200).json({
-        requiresTwoFactor: true,
-        message: 'Two-factor authentication code required',
-      });
-    }
+    // if (user.two_factor_enabled) {
+    //   return res.status(200).json({
+    //     requiresTwoFactor: true,
+    //     message: 'Two-factor authentication code required',
+    //   });
+    // }
 
     const jwtSecret = process.env.JWT_SECRET;
     if (!jwtSecret) {
       throw new Error('JWT_SECRET is missing');
     }
 
-    const token = jwt.sign(
-      {
-        sub: String(user.id),
-        role: user.role,
-        tokenVersion: user.token_version,
-      },
-      jwtSecret,
-      { expiresIn: '1d' }
-    );
+    const token = createToken(user.id, user.role, Number(user.token_version), jwtSecret);
+    const refreshToken = createToken(user.id, user.role, Number(user.token_version), jwtSecret, "REFRESH_TOKEN");
 
-    res.cookie('token', token, {
+    res.cookie('token', refreshToken, {
       httpOnly: true,
       secure: process.env.NODE_ENV === 'production',
       sameSite: 'lax',
-      maxAge: 24 * 60 * 60 * 1000,
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
     return res.status(200).json({
@@ -378,9 +405,66 @@ export const loginHandler = async (
         name: user.name,
         email: user.email,
         role: user.role,
+        isEmailVerified: user.is_email_verified,
+        isTwofactorEnabled: user.two_factor_enabled
       },
+      token
     });
   } catch (error) {
     next(error);
+  }
+};
+
+export const verifyRefreshToken = (token: string) => jwt.verify(token, process.env.JWT_SECRET!) as JwtPayload;
+
+export const refreshTokenHandler = async (req: Request, res: Response) => {
+  try {
+    const token = req.cookies.refreshToken ?? undefined;
+
+    if (!token) {
+      return res.status(401).json({ message: 'token expired' })
+    };
+
+    const { sub, tokenVersion } = verifyRefreshToken(token);
+
+    if (!sub || !tokenVersion) {
+      return res.status(401).json({ msg: 'invalid req' })
+    }
+
+    const user = await findUserById(sub as string);
+
+    if (!user) {
+      return res.status(401).json({ msg: 'invalid request' })
+    };
+
+    if (tokenVersion !== user.token_version) {
+      return res.status(401).json({ msg: 'invalid refresh token' })
+    };
+
+    const _token = createToken(user.id, user.role, user.token_version, process.env.JWT_SECRET!);
+    const refreshToken = createToken(user.id, user.role, user.token_version, process.env.JWT_SECRET!, "REFRESH_TOKEN");
+
+    res.cookie('token', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    return res.status(200).json({
+      message: 'Login successful',
+      data: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        isEmailVerified: user.is_email_verified,
+        isTwofactorEnabled: user.two_factor_enabled
+      },
+      _token
+    });
+  }
+  catch (e) {
+    return res.status(500)
   }
 };
