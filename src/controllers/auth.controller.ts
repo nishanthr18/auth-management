@@ -1,13 +1,19 @@
 import bcrypt from 'bcryptjs';
 import type { Request, Response, NextFunction } from 'express';
 import {
+  clearResetToken,
   findUserByEmail,
   findUserById,
+  findUserByResetToken,
+  incrementTokenVersion,
   markEmailAsVerified,
   registerService,
+  saveResetInitialPassword,
+  updatePassword,
 } from '../repositories/auth.repository';
 import jwt, { type JwtPayload } from 'jsonwebtoken';
 import { sendVerificationMail } from '../lib/mail';
+import crypto from 'crypto';
 
 interface EmailVerificationPayload extends JwtPayload {
   sub: string;
@@ -479,5 +485,134 @@ export const logout = async (_req: Request, res: Response) => {
 
   return res.status(200).json({
     message: 'Logged out successfully',
+  });
+};
+
+
+export const forgotPassword = async (
+  req: Request,
+  res: Response
+) => {
+  const email: string = req.body.email;
+
+  if (!email) {
+    return res.status(400).json({
+      msg: 'Email not present',
+    });
+  }
+
+  try {
+    const user = await findUserByEmail(
+      email.toLowerCase().trim()
+    );
+
+    // Prevent email enumeration
+    if (!user) {
+      return res.status(200).json({
+        msg: 'If an account exists, a reset link has been sent.'
+      });
+    }
+
+    // token sent to user
+    const rawToken = crypto
+      .randomBytes(32)
+      .toString('hex');
+
+    // token stored in DB
+    const tokenHash = crypto
+      .createHash('sha256')
+      .update(rawToken)
+      .digest('hex');
+
+    const reset_password_expires_at =
+      new Date(Date.now() + 15 * 60 * 1000);
+
+    await saveResetInitialPassword(
+      user.id,
+      tokenHash,
+      reset_password_expires_at,
+    );
+
+    const resetUrl =
+      `${getAppUrl()}/auth/reset-password?token=${rawToken}`;
+
+    const html = `
+      <h2>Password Reset Request</h2>
+      <p>You requested a password reset.</p>
+      <p>
+        <a href="${resetUrl}">
+          Reset Password
+        </a>
+      </p>
+      <p>This link expires in 15 minutes.</p>
+    `;
+
+    await sendVerificationMail(
+      user.email,
+      'Reset your password',
+      html
+    );
+
+    return res.status(200).json({
+      msg: 'Reset link sent successfully'
+    });
+
+  } catch (e) {
+    return res.status(500).json({
+      msg: 'something went wrong!'
+    });
+  }
+};
+
+export const confirmResetPassword = async (
+  req: Request,
+  res: Response
+) => {
+  const { token, password } = req.body;
+
+  if (!token || !password) {
+    return res.status(400).json({
+      msg: 'missing fields'
+    });
+  }
+
+  const tokenHash = crypto
+    .createHash('sha256')
+    .update(token)
+    .digest('hex');
+
+  const user = await findUserByResetToken(
+    tokenHash
+  );
+
+  if (!user) {
+    return res.status(400).json({
+      msg: 'invalid token'
+    });
+  }
+
+  if (
+    !user.reset_password_expires_at ||
+    user.reset_password_expires_at < new Date()
+  ) {
+    return res.status(400).json({
+      msg: 'token expired'
+    });
+  }
+
+  const passwordHash =
+    await hashPassword(password);
+
+  await updatePassword(
+    user.id,
+    passwordHash
+  );
+
+  await clearResetToken(user.id);
+
+  await incrementTokenVersion(user.id);
+
+  return res.status(200).json({
+    msg: 'password updated successfully'
   });
 };
